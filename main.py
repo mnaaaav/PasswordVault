@@ -1,46 +1,90 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from cryptography.fernet import Fernet
 import sqlite3
+from pydantic import BaseModel
 
 app = FastAPI()
 
-# Generate a key (Store it securely in production!)
-key = Fernet.generate_key()
-cipher_suite = Fernet(key)
+# Database connection
+def get_db():
+    conn = sqlite3.connect("vault.db")
+    cursor = conn.cursor()
+    return conn, cursor
 
-# Database setup
-conn = sqlite3.connect("database.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS passwords (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    website TEXT,
-    username TEXT,
-    encrypted_password TEXT
-)
-""")
-conn.commit()
+# Ensure tables exist
+def create_tables():
+    conn, cursor = get_db()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS passwords (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            website TEXT, 
+            username TEXT,
+            password TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# Define a Pydantic model for input validation
+create_tables()  # Run on startup
+
+# Pydantic models for input validation
+class User(BaseModel):
+    username: str
+    password: str
+
 class PasswordEntry(BaseModel):
     website: str
     username: str
     password: str
 
-@app.post("/store/")
-def store_password(entry: PasswordEntry):
-    encrypted_password = cipher_suite.encrypt(entry.password.encode())
-    cursor.execute("INSERT INTO passwords (website, username, encrypted_password) VALUES (?, ?, ?)",
-                   (entry.website, entry.username, encrypted_password))
-    conn.commit()
-    return {"message": "Password stored securely"}
+# User Registration
+@app.post("/register")
+def register(user: User):
+    conn, cursor = get_db()
+    try:
+        cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (user.username, user.password))
+        conn.commit()
+        return {"message": "User registered successfully"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="User already exists")
+    finally:
+        conn.close()
 
-@app.get("/retrieve/{website}")
-def retrieve_password(website: str):
-    cursor.execute("SELECT username, encrypted_password FROM passwords WHERE website = ?", (website,))
+# User Login
+@app.post("/login")
+def login(user: User):
+    conn, cursor = get_db()
+    cursor.execute("SELECT * FROM users WHERE username=? AND password=?", (user.username, user.password))
     result = cursor.fetchone()
-    if not result:
-        raise HTTPException(status_code=404, detail="No password found")
-    decrypted_password = cipher_suite.decrypt(result[1]).decode()
-    return {"website": website, "username": result[0], "password": decrypted_password}
+    conn.close()
+    
+    if result:
+        return {"message": "Login successful"}
+    else:
+        raise HTTPException(status_code=401, detail="Invalid credentials or user not registered")
+
+# Store a password
+@app.post("/store")
+def store_password(entry: PasswordEntry):
+    conn, cursor = get_db()
+    cursor.execute("INSERT INTO passwords (website, username, password) VALUES (?, ?, ?)", 
+                   (entry.website, entry.username, entry.password))
+    conn.commit()
+    conn.close()
+    return {"message": "Password stored successfully"}
+
+# Retrieve all stored passwords
+@app.get("/retrieve")
+def retrieve_passwords():
+    conn, cursor = get_db()
+    cursor.execute("SELECT website, username, password FROM passwords")
+    data = cursor.fetchall()
+    conn.close()
+    
+    return {"passwords": [{"website": row[0], "username": row[1], "password": row[2]} for row in data]}
